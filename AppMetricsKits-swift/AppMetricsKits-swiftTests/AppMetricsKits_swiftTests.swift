@@ -153,6 +153,80 @@ final class AppMetricsKitTests: XCTestCase {
             )
         )
         firstClient.track(AppMetricsEvent.paywallViewed, payload: ["plan": "monthly"])
+        // Persistence is now coalesced onto a background queue; force it to disk
+        // deterministically before reading from a second client.
+        firstClient.persistPendingEvents()
+
+        let secondClient = AppMetricsClient()
+        secondClient.configure(
+            AppMetricsConfiguration(
+                ingestURL: URL(string: "https://example.com/api/ingest")!,
+                ingestKey: "amk_live_test",
+                flushInterval: 0,
+                automaticAppLaunchTracking: false,
+                urlSession: session,
+                queueDirectory: directory
+            )
+        )
+
+        XCTAssertEqual(secondClient.pendingEventCount, 1)
+    }
+
+    func testPersistPendingEventsIsDurableForMultipleEvents() throws {
+        let directory = try makeTemporaryDirectory()
+        let session = MockURLProtocol.makeSession(statuses: [500])
+
+        let firstClient = AppMetricsClient()
+        firstClient.configure(
+            AppMetricsConfiguration(
+                ingestURL: URL(string: "https://example.com/api/ingest")!,
+                ingestKey: "amk_live_test",
+                flushInterval: 0,
+                automaticAppLaunchTracking: false,
+                urlSession: session,
+                queueDirectory: directory
+            )
+        )
+        for index in 0..<5 {
+            firstClient.track(AppMetricsEvent.featureUsed, payload: ["screen": .string("s\(index)")])
+        }
+        firstClient.persistPendingEvents()
+
+        let secondClient = AppMetricsClient()
+        secondClient.configure(
+            AppMetricsConfiguration(
+                ingestURL: URL(string: "https://example.com/api/ingest")!,
+                ingestKey: "amk_live_test",
+                flushInterval: 0,
+                automaticAppLaunchTracking: false,
+                urlSession: session,
+                queueDirectory: directory
+            )
+        )
+
+        XCTAssertEqual(secondClient.pendingEventCount, 5)
+    }
+
+    func testBackgroundDebouncedPersistenceWritesToDisk() async throws {
+        let directory = try makeTemporaryDirectory()
+        let session = MockURLProtocol.makeSession(statuses: [500])
+
+        let firstClient = AppMetricsClient()
+        firstClient.configure(
+            AppMetricsConfiguration(
+                ingestURL: URL(string: "https://example.com/api/ingest")!,
+                ingestKey: "amk_live_test",
+                flushInterval: 0,
+                automaticAppLaunchTracking: false,
+                urlSession: session,
+                queueDirectory: directory
+            )
+        )
+        firstClient.track(AppMetricsEvent.paywallViewed, payload: ["plan": "monthly"])
+
+        // No explicit persist call: the coalesced background write should land
+        // on disk on its own within the debounce window.
+        try await Task.sleep(nanoseconds: 1_500_000_000)
 
         let secondClient = AppMetricsClient()
         secondClient.configure(

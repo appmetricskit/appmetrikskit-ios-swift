@@ -13,7 +13,11 @@ let package = Package(
     targets: [
         .target(
             name: "AppMetricsKit",
-            path: "AppMetricsKits-swift/AppMetricsKits-swift"
+            path: "AppMetricsKits-swift/AppMetricsKits-swift",
+            resources: [
+                // App Store privacy manifest — must ship inside the SDK bundle.
+                .copy("PrivacyInfo.xcprivacy"),
+            ]
         ),
         .testTarget(
             name: "AppMetricsKitTests",

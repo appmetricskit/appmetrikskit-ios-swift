@@ -175,11 +175,20 @@ public final class AppMetricsClient: @unchecked Sendable {
         static let maxEventNameLength = 80
         static let eventNamePattern = #"^[A-Za-z][A-Za-z0-9]*\.[A-Za-z][A-Za-z0-9]*$"#
         static let userAgent = "AppMetricsKit-Swift/1.0"
+        /// How long rapid `track(_:)` calls are coalesced before a single
+        /// background disk write. Bounds worst-case data loss on a hard kill to
+        /// roughly this window, in exchange for keeping the hot path I/O-free.
+        static let persistDebounceInterval: TimeInterval = 1.0
     }
 
     private let lock = NSRecursiveLock()
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
+    /// Serial queue that owns every offline-queue disk write, so the calling
+    /// thread (usually the main thread) never blocks on JSON encoding or file I/O.
+    private let persistenceQueue = DispatchQueue(label: "com.appmetricskit.persistence", qos: .utility)
+    /// Whether a debounced background write is already scheduled. Guarded by `lock`.
+    private var persistScheduled = false
     private var configuration: AppMetricsConfiguration?
     private var queue: [AppMetricsQueuedEvent] = []
     private var anonymousUserId: String?
@@ -276,7 +285,7 @@ public final class AppMetricsClient: @unchecked Sendable {
 
             queue.append(event)
             trimQueueIfNeeded(maxQueueSize: configuration.maxQueueSize)
-            persistQueue(configuration: configuration)
+            schedulePersist(configuration: configuration)
 
             if queue.count >= configuration.batchSize {
                 Task { _ = await self.flush() }
@@ -412,7 +421,9 @@ public final class AppMetricsClient: @unchecked Sendable {
             case .delivered, .dropped:
                 let ids = Set(batch.map(\.eventId))
                 queue.removeAll { ids.contains($0.eventId) }
-                persistQueue(configuration: configuration)
+                // Persist the post-flush queue promptly (off the caller thread)
+                // so delivered events are not re-sent after a restart.
+                persistNow(snapshot: queue, configuration: configuration)
             case .retryLater:
                 break
             }
@@ -458,17 +469,65 @@ public final class AppMetricsClient: @unchecked Sendable {
         Self.debugWarn("Offline queue exceeded \(maxQueueSize) events. Oldest events were dropped.")
     }
 
-    private func persistQueue(configuration: AppMetricsConfiguration) {
-        let fileURL = Self.queueFileURL(configuration: configuration)
+    /// Schedules a coalesced background write of the offline queue. Rapid bursts
+    /// of `track(_:)` calls collapse into a single disk write, so the calling
+    /// thread never pays per-event JSON encoding or file I/O. Must be called
+    /// while holding `lock`.
+    private func schedulePersist(configuration: AppMetricsConfiguration) {
+        guard !persistScheduled else { return }
+        persistScheduled = true
+        persistenceQueue.asyncAfter(deadline: .now() + Constants.persistDebounceInterval) { [weak self] in
+            guard let self else { return }
+            let snapshot: [AppMetricsQueuedEvent] = self.lock.withLock {
+                self.persistScheduled = false
+                return self.queue
+            }
+            Self.writeQueue(snapshot, configuration: configuration)
+        }
+    }
+
+    /// Writes a snapshot of the queue to disk on the persistence queue without
+    /// blocking the caller. Used after a flush mutates the queue.
+    private func persistNow(snapshot: [AppMetricsQueuedEvent], configuration: AppMetricsConfiguration) {
+        persistenceQueue.async {
+            Self.writeQueue(snapshot, configuration: configuration)
+        }
+    }
+
+    /// Synchronously writes any pending events to disk and waits for all queued
+    /// writes to finish. Call this when the app is about to be suspended or
+    /// terminated (e.g. from `scenePhase`/`applicationDidEnterBackground`) to
+    /// guarantee the offline queue is durable. Safe to call on the main thread —
+    /// it performs only a bounded amount of work.
+    public func persistPendingEvents() {
+        let pending: ([AppMetricsQueuedEvent], AppMetricsConfiguration)? = lock.withLock {
+            guard persistScheduled, let configuration else { return nil }
+            persistScheduled = false
+            return (queue, configuration)
+        }
+        if let (snapshot, configuration) = pending {
+            persistenceQueue.async { Self.writeQueue(snapshot, configuration: configuration) }
+        }
+        // Barrier: block until all queued writes have drained.
+        persistenceQueue.sync {}
+    }
+
+    private static func writeQueue(
+        _ events: [AppMetricsQueuedEvent],
+        configuration: AppMetricsConfiguration
+    ) {
+        let fileURL = queueFileURL(configuration: configuration)
         do {
             try FileManager.default.createDirectory(
                 at: fileURL.deletingLastPathComponent(),
                 withIntermediateDirectories: true
             )
-            let data = try encoder.encode(queue)
+            // A local encoder keeps disk writes off the shared `encoder` used by
+            // network flushes, so the two never race.
+            let data = try JSONEncoder().encode(events)
             try data.write(to: fileURL, options: [.atomic])
         } catch {
-            Self.debugWarn("Failed to persist offline queue: \(error.localizedDescription)")
+            debugWarn("Failed to persist offline queue: \(error.localizedDescription)")
         }
     }
 
@@ -669,6 +728,12 @@ public enum AppMetricsKit {
     @discardableResult
     public static func flush() async -> AppMetricsFlushResult {
         await shared.flush()
+    }
+
+    /// Synchronously writes any pending events to disk. Call from your app's
+    /// background/terminate hook to guarantee the offline queue is durable.
+    public static func persistPendingEvents() {
+        shared.persistPendingEvents()
     }
 }
 
